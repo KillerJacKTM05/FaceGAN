@@ -37,6 +37,9 @@ class AdaIN(Layer):
         super(AdaIN, self).__init__(**kwargs)
 
     def build(self, input_shape):
+        if len(input_shape) != 4:
+           raise ValueError("Expected input shape to be 4D (batch_size, height, width, channels)")
+           
         self.beta = self.add_weight(name='beta', shape=(input_shape[-1],), initializer='zeros', trainable=True)
         self.gamma = self.add_weight(name='gamma', shape=(input_shape[-1],), initializer='ones', trainable=True)
 
@@ -58,13 +61,15 @@ def create_generator(latent_dim, num_classes):
 
     # Initial Convolution
     x = Conv2D(128, (4, 4), padding='same')(merged_input)
-    x = AdaIN(x)
+    adain_layer = AdaIN()
+    x = adain_layer(x)
     x = LeakyReLU()(x)
 
     # Upsampling blocks
     for _ in range(4):  # Increase this for higher resolution
         x = Conv2DTranspose(128, (4, 4), strides=(2, 2), padding='same')(x)
-        x = AdaIN(x)
+        adain_layer = AdaIN()
+        x = adain_layer(x)
         x = LeakyReLU()(x)
 
     # Final Convolution to produce image
@@ -99,18 +104,35 @@ def create_discriminator(img_shape, num_classes):
     model = Model([img_input, labels_input], x)
     return model
 
-def wgan_gp_loss(y_true, y_pred, averaged_samples, gradient_penalty_weight):
-    # WGAN loss
-    wgan_loss = K.mean(y_true * y_pred)
+def wgan_loss(y_true, y_pred):
+    y_true = K.expand_dims(K.expand_dims(K.expand_dims(y_true, -1), -1), -1)
+    return K.mean(y_true * y_pred)
+
+def calculate_gradient_penalty(averaged_samples, real_labels, fake_labels, discriminator):
+    # Calculate the predictions for the averaged samples
+    averaged_preds = discriminator([averaged_samples, tf.multiply(0.5, tf.add(tf.cast(real_labels, tf.float32), tf.cast(fake_labels, tf.float32)))])
     
-    # Gradient penalty
-    gradients = K.gradients(y_pred, averaged_samples)[0]
+    # Calculate the gradients of the predictions with respect to the averaged samples
+    with tf.GradientTape() as tape:
+        tape.watch(averaged_samples)
+        averaged_preds = discriminator([averaged_samples, tf.multiply(0.5, tf.add(tf.cast(real_labels, tf.float32), tf.cast(fake_labels, tf.float32)))])
+        
+    gradients = tape.gradient(averaged_preds, averaged_samples)
+    
+    # Calculate the gradient's L2 norm
     gradients_sqr = K.square(gradients)
     gradients_sqr_sum = K.sum(gradients_sqr, axis=np.arange(1, len(gradients_sqr.shape)))
     gradient_l2_norm = K.sqrt(gradients_sqr_sum)
-    gradient_penalty = gradient_penalty_weight * K.square(1 - gradient_l2_norm)
     
-    return wgan_loss + gradient_penalty
+    # Compute the gradient penalty
+    gradient_penalty = K.square(1 - gradient_l2_norm)
+    
+    return gradient_penalty
+
+def custom_binary_crossentropy(y_true, y_pred):
+    y_pred = K.mean(y_pred, axis=[1, 2, 3])  # Average over the spatial dimensions
+    return K.binary_crossentropy(y_true, y_pred)
+
 
 # Hyperparameters
 latent_dim = 100
@@ -129,25 +151,42 @@ if __name__ == "__main__":
     gan_epochs = int(input("Enter number of epochs for training GAN: "))
     batch_size = int(input("Enter batch size for training GAN: "))
     
-    #load images
+    # Load images
     # Create a list of image paths
     image_paths = [os.path.join(folderPath, fname) for fname in partition_df['image_id'].values]
     labels = attributes_df.iloc[:, 1:].values
-    # Pre-calculate the partitions
-    train_indices = partition_df[partition_df['partition'] == 0].index.values
-    val_indices = partition_df[partition_df['partition'] == 1].index.values
-    test_indices = partition_df[partition_df['partition'] == 2].index.values
+   
+    # Combine partition, image_paths, and labels into a single DataFrame
+    combined_df = partition_df.copy()
+    combined_df['image_path'] = image_paths
+    combined_df = pd.merge(combined_df, attributes_df, on='image_id')
+   
+    # Filter based on partition
+    train_df = combined_df[combined_df['partition'] == 0]
+    val_df = combined_df[combined_df['partition'] == 1]
+    test_df = combined_df[combined_df['partition'] == 2]
+   
+    # Randomly sample 1000 rows from the training DataFrame
+    train_subset = train_df.sample(n=1000)
+   
+    # Create separate lists for image_paths and labels for the subset
+    train_image_paths_subset = train_subset['image_path'].values.tolist()
+    train_labels_subset = train_subset.iloc[:, 3:].values  # Assuming attributes start from column 5
+   
+    # Create separate datasets
+    train_dataset_subset = tf.data.Dataset.from_tensor_slices((train_image_paths_subset, train_labels_subset))
+    train_dataset_subset = train_dataset_subset.map(load_image, num_parallel_calls=tf.data.experimental.AUTOTUNE).batch(batch_size).shuffle(buffer_size=1000).prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+    
+    # Randomly sample 200 rows from the validation DataFrame
+    val_subset = val_df.sample(n=200)
+
+    # Create separate lists for image_paths and labels for the subset
+    val_image_paths_subset = val_subset['image_path'].values.tolist()
+    val_labels_subset = val_subset.iloc[:, 3:].values  # Assuming attributes start from column 5
 
     # Create separate datasets
-    train_dataset = tf.data.Dataset.from_tensor_slices((image_paths[train_indices], labels[train_indices]))
-    val_dataset = tf.data.Dataset.from_tensor_slices((image_paths[val_indices], labels[val_indices]))
-    test_dataset = tf.data.Dataset.from_tensor_slices((image_paths[test_indices], labels[test_indices]))
-
-    # Map, batch, and shuffle
-    train_dataset = train_dataset.map(load_image, num_parallel_calls=tf.data.experimental.AUTOTUNE).batch(batch_size).shuffle(buffer_size=1000).prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
-    val_dataset = val_dataset.map(load_image, num_parallel_calls=tf.data.experimental.AUTOTUNE).batch(batch_size)
-    test_dataset = test_dataset.map(load_image, num_parallel_calls=tf.data.experimental.AUTOTUNE).batch(batch_size)
-
+    val_dataset_subset = tf.data.Dataset.from_tensor_slices((val_image_paths_subset, val_labels_subset))
+    val_dataset_subset = val_dataset_subset.map(load_image, num_parallel_calls=tf.data.experimental.AUTOTUNE).batch(batch_size)
     
     # Initialize models
     generator = create_generator(latent_dim, num_classes)
@@ -156,38 +195,39 @@ if __name__ == "__main__":
     # Compile models
     gen_optimizer = tf.keras.optimizers.Adam(gen_lr, 0.5)
     disc_optimizer = tf.keras.optimizers.Adam(disc_lr, 0.5)
-    discriminator.compile(optimizer=disc_optimizer, loss=wgan_gp_loss)
-    generator.compile(optimizer=gen_optimizer, loss='binary_crossentropy')
+    discriminator.compile(optimizer=disc_optimizer, loss=wgan_loss)
+    generator.compile(optimizer=gen_optimizer, loss=custom_binary_crossentropy)
     
     # Initialize ReduceLROnPlateau callback
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001)
+    reduce_lr.set_model(generator)
     
     # Placeholder for storing losses
     disc_losses = []
     gen_losses = []
 
-    # Number of batches to process per epoch
-    num_batches = batch_size
     # Training loop
     for epoch in range(gan_epochs):
-        for real_imgs, real_labels in train_dataset.take(num_batches):
-            # Sample real images and their corresponding labels
-            idx = np.random.randint(0, train_dataset.shape[0], batch_size)
-            real_imgs = train_dataset[idx]
-            real_labels = attributes_df.iloc[idx, 1:].values  # Assuming attributes start from column 1
-        
+        print(f"Epoch {epoch + 1}/{gan_epochs} starting..")        
+        for real_imgs, real_labels in  train_dataset_subset:        
             # Generate fake images using the generator
             noise = np.random.normal(0, 1, (batch_size, latent_dim))
             fake_labels = np.random.choice([-1, 1], size=(batch_size, num_classes))
             fake_imgs = generator.predict([noise, fake_labels])
-        
+            
             # Train the discriminator
             real = np.ones((batch_size, 1))
             fake = -np.ones((batch_size, 1))
         
+            # Calculate averaged samples
+            averaged_samples = 0.5 * (real_imgs + fake_imgs)
+    
+            # Calculate gradient penalty (this is a simplified example; you'll need to implement this)
+            gradient_penalty = calculate_gradient_penalty(averaged_samples, real_labels, fake_labels, discriminator)
+            
             d_loss_real = discriminator.train_on_batch([real_imgs, real_labels], real)
             d_loss_fake = discriminator.train_on_batch([fake_imgs, fake_labels], fake)
-            d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+            d_loss = 0.5 * np.add(d_loss_real, d_loss_fake) + gradient_penalty_weight * gradient_penalty
         
             # Train the generator
             g_loss = generator.train_on_batch([noise, fake_labels], real)
@@ -195,24 +235,21 @@ if __name__ == "__main__":
             # Store losses for visualization
             disc_losses.append(d_loss)
             gen_losses.append(g_loss)
+            
+        for val_imgs, val_labels in val_dataset_subset:
+            # Calculate validation loss   
+            val_noise = np.random.normal(0, 1, (batch_size, latent_dim))
+            val_fake_labels = np.random.choice([-1, 1], size=(batch_size, num_classes))
+            val_fake_imgs = generator.predict([val_noise, val_fake_labels])
+
+            val_real = np.ones((batch_size, 1))
+            val_fake = -np.ones((batch_size, 1))
+
+            val_d_loss_real = discriminator.evaluate([val_imgs, val_labels], val_real, verbose=0)
+            val_d_loss_fake = discriminator.evaluate([val_fake_imgs, val_fake_labels], val_fake, verbose=0)
+            val_d_loss = 0.5 * np.add(val_d_loss_real, val_d_loss_fake)
     
-        # Calculate validation loss
-        idx_val = np.random.randint(0, val_dataset.shape[0], batch_size)
-        val_imgs = val_dataset[idx_val]
-        val_labels = attributes_df.iloc[idx_val, 1:].values
-    
-        val_noise = np.random.normal(0, 1, (batch_size, latent_dim))
-        val_fake_labels = np.random.choice([-1, 1], size=(batch_size, num_classes))
-        val_fake_imgs = generator.predict([val_noise, val_fake_labels])
-    
-        val_real = np.ones((batch_size, 1))
-        val_fake = -np.ones((batch_size, 1))
-    
-        val_d_loss_real = discriminator.evaluate([val_imgs, val_labels], val_real, verbose=0)
-        val_d_loss_fake = discriminator.evaluate([val_fake_imgs, val_fake_labels], val_fake, verbose=0)
-        val_d_loss = 0.5 * np.add(val_d_loss_real, val_d_loss_fake)
-    
-    # Apply ReduceLROnPlateau
+        # Apply ReduceLROnPlateau
         reduce_lr.on_epoch_end(epoch, logs={'val_loss': val_d_loss})
     
         # Visualization and model-saving every 10% of total epochs
