@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tqdm import tqdm
 from tensorflow.keras import layers, Model
-from tensorflow.keras.layers import Embedding, Flatten, Dense, Reshape, Multiply, Conv2D, BatchNormalization, LeakyReLU, UpSampling2D
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.layers import Embedding, Flatten, Dense, Reshape, Multiply, Conv2D, BatchNormalization, LeakyReLU, UpSampling2D, Dropout
 
 data_dir = "./RAF-DB"
 save_dir = './saved_models/'
@@ -27,6 +28,10 @@ for i, emotion in enumerate(emotions):
 
 images = np.array(images, dtype=np.float32) / 255.0  # Normalize the images to [0, 1]
 labels = np.array(labels)
+
+def flip_image(images):
+    flipped_images = tf.image.random_flip_left_right(images)
+    return flipped_images
 
 def residual_block(x, filters, kernel_size=3):
     y = Conv2D(filters, kernel_size=kernel_size, padding='same')(x)
@@ -54,11 +59,11 @@ def build_generator(z_dim, num_classes=7):
     x = residual_block(x, 128)
     x = layers.UpSampling2D()(x)
     
-    x = Conv2D(64, kernel_size=1, padding='same')(x)  # Adjusting number of channels to 64
+    x = Conv2D(64, kernel_size=1, padding='same', kernel_regularizer=l2(0.01))(x)
     x = residual_block(x, 64)
     x = layers.UpSampling2D()(x)
     
-    x = Conv2D(32, kernel_size=1, padding='same')(x)  # Adjusting number of channels to 32
+    x = Conv2D(32, kernel_size=1, padding='same', kernel_regularizer=l2(0.01))(x)
     x = residual_block(x, 32)
     x = layers.Conv2D(3, kernel_size=3, padding='same', activation='tanh')(x)
     
@@ -142,6 +147,7 @@ def train_discriminator(images, labels):
         
     gradients = disc_tape.gradient(total_loss, discriminator.trainable_variables)
     discriminator_optimizer.apply_gradients(zip(gradients, discriminator.trainable_variables))
+    return total_loss
 
 # Training step function for the generator
 @tf.function
@@ -158,18 +164,39 @@ def train_generator(labels):
         
     gradients = gen_tape.gradient(gen_loss, generator.trainable_variables)
     generator_optimizer.apply_gradients(zip(gradients, generator.trainable_variables))
+    return gen_loss
 
 # Training loop
+d_losses = []
+g_losses = []
 for epoch in range(epochs):
     print(f"\nEpoch {epoch + 1}/{epochs}")
     
-    for i in tqdm(range(0, len(images), batch_size)):
-        image_batch = images[i:i+batch_size]
-        label_batch = labels[i:i+batch_size]
+    epoch_d_losses = []
+    epoch_g_losses = []
+    # Shuffle images and labels
+    permutation = np.random.permutation(len(images))
+    shuffled_images = images[permutation]
+    shuffled_labels = labels[permutation]
+    
+    for i in tqdm(range(0, len(shuffled_images), batch_size)):
+        image_batch = shuffled_images[i:i+batch_size]
+        image_batch = flip_image(image_batch)
+        label_batch = shuffled_labels[i:i+batch_size]
         
-        train_discriminator(image_batch, label_batch)
-        train_generator(label_batch)
+        d_loss = train_discriminator(image_batch, label_batch)
+        d_loss = train_discriminator(image_batch, label_batch)
+        g_loss = train_generator(label_batch)
         
+        epoch_d_losses.append(d_loss)
+        epoch_g_losses.append(g_loss)
+        
+    # Calculate mean losses for the epoch
+    mean_d_loss = np.mean(epoch_d_losses)
+    mean_g_loss = np.mean(epoch_g_losses)    
+    d_losses.append(mean_d_loss)
+    g_losses.append(mean_g_loss) 
+    
     # Generate images after the epoch
     noise = tf.random.normal([len(emotions), z_dim])
     labels_tensor = tf.convert_to_tensor(list(range(len(emotions))))
@@ -181,4 +208,6 @@ for epoch in range(epochs):
         axs[i].title.set_text(emotions[i])
         axs[i].axis('off')
     plt.show()
-    generator.save_weights(os.path.join(save_dir, f'generator_epoch_{epoch+1}.h5'))
+    print(f"Discriminator Loss: {mean_d_loss}, Generator Loss: {mean_g_loss}")
+    generator.save_weights(os.path.join(save_dir, 'generator_weights.h5'))
+    discriminator.save_weights(os.path.join(save_dir, 'discriminator_weights.h5'))
