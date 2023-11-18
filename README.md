@@ -9,3 +9,8 @@ More balanced approach and more insightful image creating loop added. Another 20
 In models, there is not much change instead of some hyperparameter tuning and a usage tring of L2 regularization method.
 In epoch 20, we can clearly see gestures in each type of expression, however images are still way more far from being a real person.
 Image postprocess and more extensive regularization technics (L1-L2 together, otehr normalization methods etc.) planned to use later.
+
+# 18.11 progression
+I couldn't made the standard cGan better than previous iteration. It actually learns the some kind face attributes after 15-ish epochs but cannot have power to generate realistic images.
+Instead of continuing, i simply started to a new project which uses domain transfering method. It uses celeb-a and rafdb datasets and tries to merge in together to a single combined model.
+Base codes provided. Not yet tested.
